@@ -1,0 +1,5 @@
+awslambdaric
+tifffile
+zarr>=3
+scikit-image
+numpy

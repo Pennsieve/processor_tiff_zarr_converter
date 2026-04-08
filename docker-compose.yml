@@ -1,0 +1,10 @@
+services:
+  processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - dev.env
+    volumes:
+      - ./data/input:/data/input:ro
+      - ./data/output:/data/output
