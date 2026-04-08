@@ -129,7 +129,7 @@ def write_ome_zarr(levels, out_path, config, initial_downsample):
             str(i),
             data=data_5d,
             chunks=(1, c_chunk, 1, tile_size, tile_size),
-            codecs=codecs,
+            compressors=codecs,
             overwrite=True,
         )
 
