@@ -188,15 +188,7 @@ def process_file(filepath, output_dir, config):
     basename = os.path.basename(filepath)
     log.info("Processing: %s", basename)
 
-    # Determine output name
-    for ext in (".ome.tiff", ".ome.tif", ".tiff", ".tif"):
-        if basename.lower().endswith(ext):
-            out_name = basename[: len(basename) - len(ext)] + ".ome.zarr"
-            break
-    else:
-        out_name = basename + ".ome.zarr"
-
-    out_path = os.path.join(output_dir, out_name)
+    out_path = output_dir
 
     log.info("Reading image...")
     with tifffile.TiffFile(filepath) as tif:
