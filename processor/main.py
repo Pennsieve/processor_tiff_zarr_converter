@@ -97,7 +97,7 @@ def build_pyramid_levels(image, config):
     return levels
 
 
-def write_ome_zarr(levels, out_path, config, initial_downsample):
+def write_ome_zarr(levels, out_path, config, initial_downsample, name=None):
     """Write pyramid levels as an OME-Zarr (v3) dataset."""
     tile_size = config["tile_size"]
     cname = config["compression"]
@@ -157,7 +157,7 @@ def write_ome_zarr(levels, out_path, config, initial_downsample):
 
     root.attrs["multiscales"] = [{
         "version": "0.4",
-        "name": os.path.basename(out_path).replace(".ome.zarr", ""),
+        "name": name or os.path.basename(out_path),
         "axes": axes,
         "datasets": datasets,
         "type": "gaussian",
@@ -190,6 +190,13 @@ def process_file(filepath, output_dir, config):
 
     out_path = output_dir
 
+    # Derive a human-readable name for OME-Zarr metadata
+    zarr_name = basename
+    for ext in (".ome.tiff", ".ome.tif", ".tiff", ".tif"):
+        if basename.lower().endswith(ext):
+            zarr_name = basename[: len(basename) - len(ext)]
+            break
+
     log.info("Reading image...")
     with tifffile.TiffFile(filepath) as tif:
         page = tif.pages[0]
@@ -207,8 +214,8 @@ def process_file(filepath, output_dir, config):
     log.info("  Generated %d levels", len(levels))
 
     log.info("Writing OME-Zarr to %s", out_path)
-    write_ome_zarr(levels, out_path, config, config["initial_downsample"])
-    log.info("Done: %s", out_name)
+    write_ome_zarr(levels, out_path, config, config["initial_downsample"], name=zarr_name)
+    log.info("Done: %s", out_path)
 
 
 def run():
