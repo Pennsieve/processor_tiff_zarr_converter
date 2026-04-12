@@ -14,7 +14,6 @@ import shutil
 import numpy as np
 import tifffile
 import zarr
-from zarr.codecs import BloscCodec
 from zarr.storage import LocalStore
 from skimage.transform import downscale_local_mean
 
@@ -98,19 +97,15 @@ def build_pyramid_levels(image, config):
 
 
 def write_ome_zarr(levels, out_path, config, initial_downsample, name=None):
-    """Write pyramid levels as an OME-Zarr (v3) dataset."""
+    """Write pyramid levels as an OME-Zarr (v2) dataset."""
     tile_size = config["tile_size"]
-    cname = config["compression"]
-    clevel = config["compression_level"]
     per_channel = config["channel_chunking"] == "per-channel"
-
-    codecs = [BloscCodec(cname=cname, clevel=clevel, shuffle="bitshuffle")]
 
     if os.path.exists(out_path):
         shutil.rmtree(out_path)
 
     store = LocalStore(out_path)
-    root = zarr.open_group(store, mode="w", zarr_format=3)
+    root = zarr.open_group(store, mode="w", zarr_format=2)
 
     num_channels = levels[0].shape[2] if levels[0].ndim == 3 else 1
     c_chunk = 1 if per_channel else num_channels
@@ -129,7 +124,6 @@ def write_ome_zarr(levels, out_path, config, initial_downsample, name=None):
             str(i),
             data=data_5d,
             chunks=(1, c_chunk, 1, tile_size, tile_size),
-            compressors=codecs,
             overwrite=True,
         )
 
