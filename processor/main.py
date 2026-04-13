@@ -119,15 +119,16 @@ def write_ome_zarr(levels, out_path, config, initial_downsample, name=None):
         h, w = level_data.shape[0], level_data.shape[1]
         c = level_data.shape[2] if level_data.ndim == 3 else 1
 
+        # Write as 3D (c, y, x) — no singleton t/z dims
         if level_data.ndim == 3:
-            data_5d = level_data.transpose(2, 0, 1).reshape(1, c, 1, h, w)
+            data = level_data.transpose(2, 0, 1)  # (h, w, c) → (c, y, x)
         else:
-            data_5d = level_data.reshape(1, 1, 1, h, w)
+            data = level_data.reshape(1, h, w)
 
         root.create_array(
             str(i),
-            data=data_5d,
-            chunks=(1, c_chunk, 1, tile_size, tile_size),
+            data=data,
+            chunks=(c_chunk, tile_size, tile_size),
             compressors=codecs,
             overwrite=True,
         )
@@ -137,7 +138,7 @@ def write_ome_zarr(levels, out_path, config, initial_downsample, name=None):
             "path": str(i),
             "coordinateTransformations": [{
                 "type": "scale",
-                "scale": [1.0, 1.0, 1.0, scale_factor, scale_factor],
+                "scale": [1.0, scale_factor, scale_factor],
             }],
         })
 
@@ -147,9 +148,7 @@ def write_ome_zarr(levels, out_path, config, initial_downsample, name=None):
         )
 
     axes = [
-        {"name": "t", "type": "time"},
         {"name": "c", "type": "channel"},
-        {"name": "z", "type": "space", "unit": "micrometer"},
         {"name": "y", "type": "space", "unit": "micrometer"},
         {"name": "x", "type": "space", "unit": "micrometer"},
     ]
