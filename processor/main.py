@@ -14,7 +14,7 @@ import shutil
 import numpy as np
 import tifffile
 import zarr
-from zarr.codecs import BytesCodec
+from zarr.codecs import BloscCodec
 from zarr.storage import LocalStore
 from skimage.transform import downscale_local_mean
 
@@ -98,9 +98,12 @@ def build_pyramid_levels(image, config):
 
 
 def write_ome_zarr(levels, out_path, config, initial_downsample, name=None):
-    """Write pyramid levels as an OME-Zarr (v3) dataset with no compression."""
+    """Write pyramid levels as an OME-Zarr (v3) dataset."""
     tile_size = config["tile_size"]
     per_channel = config["channel_chunking"] == "per-channel"
+
+    # Use blosc with byte shuffle (not bitshuffle) for neuroglancer compatibility
+    codecs = [BloscCodec(cname="lz4", clevel=5, shuffle="shuffle")]
 
     if os.path.exists(out_path):
         shutil.rmtree(out_path)
@@ -125,7 +128,7 @@ def write_ome_zarr(levels, out_path, config, initial_downsample, name=None):
             str(i),
             data=data_5d,
             chunks=(1, c_chunk, 1, tile_size, tile_size),
-            codecs=[BytesCodec()],
+            compressors=codecs,
             overwrite=True,
         )
 
