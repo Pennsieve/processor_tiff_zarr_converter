@@ -37,7 +37,7 @@ Pennsieve processor that converts OME-TIFF files to multi-resolution OME-Zarr py
 | `COMPRESSION_LEVEL` | `5` | Compression level (1-9, higher = smaller but slower) |
 | `MAX_LEVELS` | `0` | Maximum number of pyramid levels. `0` = auto (generate until min dimension reached) |
 | `MIN_DIMENSION` | `256` | Stop generating levels when both dimensions are at or below this value |
-| `CHANNEL_CHUNKING` | `per-channel` | `per-channel` = each channel is an independent chunk (enables per-channel fetching in viewers). `bundled` = all channels in one chunk. |
+| `CHANNEL_CHUNKING` | `auto` | `auto` = bundled for RGB images, per-channel for grayscale (detected from TIFF photometric tag). `per-channel` = each channel is an independent chunk. `bundled` = all channels in one chunk. |
 
 ## Output Format
 

@@ -2,11 +2,13 @@
 OME-Zarr pyramid processor.
 
 Reads OME-TIFF files from INPUT_DIR and writes multi-resolution OME-Zarr
-pyramids to OUTPUT_DIR. The full resolution level can optionally be excluded
-to keep the output lightweight for web-based tile viewers.
+pyramids to OUTPUT_DIR. Handles 2D and 3D (Z-stack) inputs. For 3D inputs,
+Z downsampling is chosen from PhysicalSize metadata by default: isotropic
+volumes get (2,2,2) downsampling, anisotropic ones keep Z at native res.
 """
 
 import os
+import re
 import sys
 import logging
 import shutil
@@ -35,7 +37,9 @@ def get_config():
         "compression_level": int(os.environ.get("COMPRESSION_LEVEL", "5")),
         "max_levels": int(os.environ.get("MAX_LEVELS", "0")),
         "min_dimension": int(os.environ.get("MIN_DIMENSION", "256")),
-        "channel_chunking": os.environ.get("CHANNEL_CHUNKING", "per-channel"),
+        "channel_chunking": os.environ.get("CHANNEL_CHUNKING", "auto"),
+        "z_downsample": os.environ.get("Z_DOWNSAMPLE", "auto"),
+        "z_chunk": int(os.environ.get("Z_CHUNK", "16")),
     }
 
 
@@ -64,45 +68,93 @@ def find_tiff_files(input_dir):
     return files
 
 
-def build_pyramid_levels(image, config):
-    """Downsample the image into a list of pyramid levels."""
+def _parse_physical_sizes(ome_xml):
+    """Return (pz, py, px) in micrometers, defaulting to 1.0 when absent."""
+    def grab(key):
+        m = re.search(rf'{key}="([\d.]+)"', ome_xml or "")
+        return float(m.group(1)) if m else 1.0
+    return grab("PhysicalSizeZ"), grab("PhysicalSizeY"), grab("PhysicalSizeX")
+
+
+def read_volume(filepath):
+    """Read TIFF into a (Z, Y, X, C) volume with physical voxel sizes."""
+    with tifffile.TiffFile(filepath) as tif:
+        series = tif.series[0]
+        arr = series.asarray()
+        axes = series.axes
+        page = tif.pages[0]
+        is_rgb = page.photometric == tifffile.PHOTOMETRIC.RGB
+        physical = _parse_physical_sizes(tif.ome_metadata)
+
+    for ax in "ZYXC":
+        has_channel_as_samples = ax == "C" and "S" in axes
+        if ax not in axes and not has_channel_as_samples:
+            arr = np.expand_dims(arr, 0)
+            axes = ax + axes
+    axes = axes.replace("S", "C")
+    order = [axes.index(a) for a in "ZYXC"]
+    return arr.transpose(order), physical, is_rgb
+
+
+def choose_z_downsample(mode, physical_sizes):
+    pz, py, px = physical_sizes
+    if mode == "isotropic":
+        return True
+    if mode == "none":
+        return False
+    xy = min(py, px)
+    return xy > 0 and pz / xy <= 2.0
+
+
+def build_pyramid_levels(volume, config, z_downsample):
+    """volume is (Z, Y, X, C). Returns a list of pyramid levels."""
     initial_ds = config["initial_downsample"]
     min_dim = config["min_dimension"]
     max_levels = config["max_levels"]
+    factors = (2 if z_downsample else 1, 2, 2, 1)
 
-    # Apply initial downsample (skip full resolution)
-    current = image
+    def halve(arr):
+        cropped = tuple(
+            slice(0, arr.shape[i] - (arr.shape[i] % factors[i]))
+            for i in range(arr.ndim)
+        )
+        return downscale_local_mean(arr[cropped], factors).astype(volume.dtype)
+
+    current = volume
     if initial_ds > 1:
         for _ in range(int(np.log2(initial_ds))):
-            h, w = current.shape[0], current.shape[1]
-            h_even, w_even = h - (h % 2), w - (w % 2)
-            current = downscale_local_mean(
-                current[:h_even, :w_even], (2, 2, 1)
-            ).astype(image.dtype)
+            current = halve(current)
 
     levels = [current]
-
     while True:
         if max_levels > 0 and len(levels) >= max_levels:
             break
-        h, w = current.shape[0], current.shape[1]
+        h, w = current.shape[1], current.shape[2]
         if h <= min_dim and w <= min_dim:
             break
-        h_even, w_even = h - (h % 2), w - (w % 2)
-        current = downscale_local_mean(
-            current[:h_even, :w_even], (2, 2, 1)
-        ).astype(image.dtype)
+        current = halve(current)
         levels.append(current)
 
     return levels
 
 
-def write_ome_zarr(levels, out_path, config, initial_downsample, name=None):
+def write_ome_zarr(levels, out_path, config, initial_downsample,
+                   physical_sizes, z_downsampled, name=None, is_rgb=False):
     """Write pyramid levels as an OME-Zarr (v3) dataset."""
     tile_size = config["tile_size"]
-    per_channel = config["channel_chunking"] == "per-channel"
+    chunking = config["channel_chunking"]
+    z_chunk_cfg = config["z_chunk"]
 
-    # Use blosc with byte shuffle (not bitshuffle) for neuroglancer compatibility
+    num_channels = levels[0].shape[3]
+    is_3d = levels[0].shape[0] > 1
+
+    if chunking == "auto":
+        per_channel = not is_rgb
+        log.info("  Auto channel chunking: %s (is_rgb=%s)",
+                 "bundled" if is_rgb else "per-channel", is_rgb)
+    else:
+        per_channel = chunking == "per-channel"
+
     codecs = [BloscCodec(cname="lz4", clevel=5, shuffle="shuffle")]
 
     if os.path.exists(out_path):
@@ -111,47 +163,57 @@ def write_ome_zarr(levels, out_path, config, initial_downsample, name=None):
     store = LocalStore(out_path)
     root = zarr.open_group(store, mode="w", zarr_format=3)
 
-    num_channels = levels[0].shape[2] if levels[0].ndim == 3 else 1
     c_chunk = 1 if per_channel else num_channels
+    pz, py, px = physical_sizes
+    xy_unit = min(py, px) if min(py, px) > 0 else 1.0
+    z_ratio = pz / xy_unit
 
     datasets = []
-    for i, level_data in enumerate(levels):
-        h, w = level_data.shape[0], level_data.shape[1]
-        c = level_data.shape[2] if level_data.ndim == 3 else 1
-
-        # Write as 3D (c, y, x) — no singleton t/z dims
-        if level_data.ndim == 3:
-            data = level_data.transpose(2, 0, 1)  # (h, w, c) → (c, y, x)
+    for i, level in enumerate(levels):
+        if is_3d:
+            data = level.transpose(3, 0, 1, 2)  # (Z,Y,X,C) → (C,Z,Y,X)
+            chunks = (c_chunk, min(z_chunk_cfg, data.shape[1]),
+                      tile_size, tile_size)
         else:
-            data = level_data.reshape(1, h, w)
+            data = level.transpose(3, 0, 1, 2).squeeze(1)  # → (C,Y,X)
+            chunks = (c_chunk, tile_size, tile_size)
 
         root.create_array(
             str(i),
             data=data,
-            chunks=(c_chunk, tile_size, tile_size),
+            chunks=chunks,
             compressors=codecs,
             overwrite=True,
         )
 
-        scale_factor = float(initial_downsample * (2 ** i))
+        xy_scale = float(initial_downsample * (2 ** i))
+        z_mult = xy_scale if z_downsampled else 1.0
+        if is_3d:
+            scale = [1.0, z_ratio * z_mult, xy_scale, xy_scale]
+        else:
+            scale = [1.0, xy_scale, xy_scale]
+
         datasets.append({
             "path": str(i),
-            "coordinateTransformations": [{
-                "type": "scale",
-                "scale": [1.0, scale_factor, scale_factor],
-            }],
+            "coordinateTransformations": [{"type": "scale", "scale": scale}],
         })
 
-        log.info(
-            "  Level %d: %d x %d (scale %.0fx)",
-            i, w, h, scale_factor,
-        )
+        log.info("  Level %d: shape=%s chunks=%s (XY %.0fx)",
+                 i, data.shape, chunks, xy_scale)
 
-    axes = [
-        {"name": "c", "type": "channel"},
-        {"name": "y", "type": "space", "unit": "micrometer"},
-        {"name": "x", "type": "space", "unit": "micrometer"},
-    ]
+    if is_3d:
+        axes = [
+            {"name": "c", "type": "channel"},
+            {"name": "z", "type": "space", "unit": "micrometer"},
+            {"name": "y", "type": "space", "unit": "micrometer"},
+            {"name": "x", "type": "space", "unit": "micrometer"},
+        ]
+    else:
+        axes = [
+            {"name": "c", "type": "channel"},
+            {"name": "y", "type": "space", "unit": "micrometer"},
+            {"name": "x", "type": "space", "unit": "micrometer"},
+        ]
 
     root.attrs["multiscales"] = [{
         "version": "0.4",
@@ -161,8 +223,8 @@ def write_ome_zarr(levels, out_path, config, initial_downsample, name=None):
         "type": "gaussian",
         "metadata": {
             "description": (
-                f"Pyramid with initial_downsample={initial_downsample}. "
-                f"Level 0 = {initial_downsample}x downsampled from original."
+                f"Pyramid with initial_downsample={initial_downsample}, "
+                f"z_downsampled={z_downsampled}."
             ),
         },
     }]
@@ -188,7 +250,6 @@ def process_file(filepath, output_dir, config):
 
     out_path = output_dir
 
-    # Derive a human-readable name for OME-Zarr metadata
     zarr_name = basename
     for ext in (".ome.tiff", ".ome.tif", ".tiff", ".tif"):
         if basename.lower().endswith(ext):
@@ -196,23 +257,22 @@ def process_file(filepath, output_dir, config):
             break
 
     log.info("Reading image...")
-    with tifffile.TiffFile(filepath) as tif:
-        page = tif.pages[0]
-        image = page.asarray()
+    volume, physical, is_rgb = read_volume(filepath)
+    z_ds = choose_z_downsample(config["z_downsample"], physical)
     log.info(
-        "  Image shape: %s, dtype: %s, tile: %dx%d",
-        image.shape, image.dtype, page.tilewidth, page.tilelength,
+        "  Volume (Z,Y,X,C): %s, dtype: %s, photometric: %s, "
+        "physical (z,y,x) µm: %s, z_downsample: %s",
+        volume.shape, volume.dtype,
+        "RGB" if is_rgb else "grayscale", physical, z_ds,
     )
 
-    if image.ndim == 2:
-        image = image[:, :, np.newaxis]
-
     log.info("Building pyramid levels...")
-    levels = build_pyramid_levels(image, config)
+    levels = build_pyramid_levels(volume, config, z_ds)
     log.info("  Generated %d levels", len(levels))
 
     log.info("Writing OME-Zarr to %s", out_path)
-    write_ome_zarr(levels, out_path, config, config["initial_downsample"], name=zarr_name)
+    write_ome_zarr(levels, out_path, config, config["initial_downsample"],
+                   physical, z_ds, name=zarr_name, is_rgb=is_rgb)
     log.info("Done: %s", out_path)
 
 
