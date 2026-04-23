@@ -69,11 +69,19 @@ def find_tiff_files(input_dir):
 
 
 def _parse_physical_sizes(ome_xml):
-    """Return (pz, py, px) in micrometers, defaulting to 1.0 when absent."""
+    """Return ((pz, py, px), found) in micrometers; found is a per-axis dict
+    indicating whether the value came from OME metadata (True) or was
+    defaulted to 1.0 because the attribute was absent (False).
+    """
     def grab(key):
         m = re.search(rf'{key}="([\d.]+)"', ome_xml or "")
-        return float(m.group(1)) if m else 1.0
-    return grab("PhysicalSizeZ"), grab("PhysicalSizeY"), grab("PhysicalSizeX")
+        if m:
+            return float(m.group(1)), True
+        return 1.0, False
+    pz, fz = grab("PhysicalSizeZ")
+    py, fy = grab("PhysicalSizeY")
+    px, fx = grab("PhysicalSizeX")
+    return (pz, py, px), {"z": fz, "y": fy, "x": fx}
 
 
 def read_volume(filepath):
@@ -84,7 +92,21 @@ def read_volume(filepath):
         axes = series.axes
         page = tif.pages[0]
         is_rgb = page.photometric == tifffile.PHOTOMETRIC.RGB
-        physical = _parse_physical_sizes(tif.ome_metadata)
+        physical, found = _parse_physical_sizes(tif.ome_metadata)
+
+    pz, py, px = physical
+    missing = [ax for ax in ("z", "y", "x") if not found[ax]]
+    if missing:
+        log.warning(
+            "  OME PhysicalSize missing for axes %s; defaulted to 1.0 µm. "
+            "Parsed values (z,y,x) µm: (%s, %s, %s)",
+            missing, pz, py, px,
+        )
+    else:
+        log.info(
+            "  OME PhysicalSize (z,y,x) µm from metadata: (%s, %s, %s)",
+            pz, py, px,
+        )
 
     for ax in "ZYXC":
         has_channel_as_samples = ax == "C" and "S" in axes
@@ -198,8 +220,15 @@ def write_ome_zarr(levels, out_path, config, initial_downsample,
             "coordinateTransformations": [{"type": "scale", "scale": scale}],
         })
 
-        log.info("  Level %d: shape=%s chunks=%s (XY %.0fx)",
-                 i, data.shape, chunks, xy_scale)
+        out_px = px * xy_scale
+        out_py = py * xy_scale
+        out_pz = pz * z_mult
+        log.info(
+            "  Level %d: shape=%s chunks=%s (XY %.0fx) "
+            "voxel µm (z,y,x): (%.4f, %.4f, %.4f) scale=%s",
+            i, data.shape, chunks, xy_scale,
+            out_pz, out_py, out_px, scale,
+        )
 
     if is_3d:
         axes = [
