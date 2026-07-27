@@ -5,6 +5,9 @@ Reads OME-TIFF files from INPUT_DIR and writes multi-resolution OME-Zarr
 pyramids to OUTPUT_DIR. Handles 2D and 3D (Z-stack) inputs. For 3D inputs,
 Z downsampling is chosen from PhysicalSize metadata by default: isotropic
 volumes get (2,2,2) downsampling, anisotropic ones keep Z at native res.
+
+Uses pyvips for streaming/tiled processing so peak memory stays low
+regardless of image size.
 """
 
 import os
@@ -14,17 +17,27 @@ import logging
 import shutil
 
 import numpy as np
-import tifffile
+import pyvips
 import zarr
 from zarr.codecs import BloscCodec
 from zarr.storage import LocalStore
-from skimage.transform import downscale_local_mean
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("processor-ome-zarr")
+
+FORMAT_TO_DTYPE = {
+    "uchar": np.uint8,
+    "char": np.int8,
+    "ushort": np.uint16,
+    "short": np.int16,
+    "uint": np.uint32,
+    "int": np.int32,
+    "float": np.float32,
+    "double": np.float64,
+}
 
 
 def get_config():
@@ -84,40 +97,6 @@ def _parse_physical_sizes(ome_xml):
     return (pz, py, px), {"z": fz, "y": fy, "x": fx}
 
 
-def read_volume(filepath):
-    """Read TIFF into a (Z, Y, X, C) volume with physical voxel sizes."""
-    with tifffile.TiffFile(filepath) as tif:
-        series = tif.series[0]
-        arr = series.asarray()
-        axes = series.axes
-        page = tif.pages[0]
-        is_rgb = page.photometric == tifffile.PHOTOMETRIC.RGB
-        physical, found = _parse_physical_sizes(tif.ome_metadata)
-
-    pz, py, px = physical
-    missing = [ax for ax in ("z", "y", "x") if not found[ax]]
-    if missing:
-        log.warning(
-            "  OME PhysicalSize missing for axes %s; defaulted to 1.0 µm. "
-            "Parsed values (z,y,x) µm: (%s, %s, %s)",
-            missing, pz, py, px,
-        )
-    else:
-        log.info(
-            "  OME PhysicalSize (z,y,x) µm from metadata: (%s, %s, %s)",
-            pz, py, px,
-        )
-
-    for ax in "ZYXC":
-        has_channel_as_samples = ax == "C" and "S" in axes
-        if ax not in axes and not has_channel_as_samples:
-            arr = np.expand_dims(arr, 0)
-            axes = ax + axes
-    axes = axes.replace("S", "C")
-    order = [axes.index(a) for a in "ZYXC"]
-    return arr.transpose(order), physical, is_rgb
-
-
 def choose_z_downsample(mode, physical_sizes):
     pz, py, px = physical_sizes
     if mode == "isotropic":
@@ -128,56 +107,203 @@ def choose_z_downsample(mode, physical_sizes):
     return xy > 0 and pz / xy <= 2.0
 
 
-def build_pyramid_levels(volume, config, z_downsample):
-    """volume is (Z, Y, X, C). Returns a list of pyramid levels."""
+def open_image(filepath):
+    """Open a TIFF lazily with pyvips, extracting metadata only.
+
+    Returns a dict with image info — no pixel data is loaded into memory.
+    """
+    img = pyvips.Image.new_from_file(filepath, access="sequential")
+
+    width = img.width
+    height = img.height
+    bands = img.bands
+    n_pages = img.get("n-pages") if img.get_typeof("n-pages") else 1
+    interp = img.interpretation
+
+    is_rgb = interp in ("srgb", "rgb", "scrgb")
+
+    ome_xml = None
+    if img.get_typeof("image-description"):
+        ome_xml = img.get("image-description")
+
+    physical, found = _parse_physical_sizes(ome_xml)
+
+    missing = [ax for ax in ("z", "y", "x") if not found[ax]]
+    if missing:
+        log.warning(
+            "  OME PhysicalSize missing for axes %s; defaulted to 1.0 µm. "
+            "Parsed values (z,y,x) µm: (%s, %s, %s)",
+            missing, physical[0], physical[1], physical[2],
+        )
+    else:
+        log.info(
+            "  OME PhysicalSize (z,y,x) µm from metadata: (%s, %s, %s)",
+            physical[0], physical[1], physical[2],
+        )
+
+    vips_format = img.format
+    dtype = FORMAT_TO_DTYPE.get(vips_format, np.uint8)
+
+    return {
+        "filepath": filepath,
+        "width": width,
+        "height": height,
+        "bands": bands,
+        "n_pages": n_pages,
+        "is_rgb": is_rgb,
+        "physical": physical,
+        "dtype": dtype,
+        "vips_format": vips_format,
+    }
+
+
+def compute_pyramid_plan(image_info, config, z_downsample):
+    """Compute shapes, shrink factors, and coordinate scales for all pyramid levels.
+
+    Pure math — no pixel data touched.
+    """
     initial_ds = config["initial_downsample"]
     min_dim = config["min_dimension"]
     max_levels = config["max_levels"]
-    factors = (2 if z_downsample else 1, 2, 2, 1)
+    tile_size = config["tile_size"]
+    z_chunk_cfg = config["z_chunk"]
+    chunking = config["channel_chunking"]
 
-    def halve(arr):
-        cropped = tuple(
-            slice(0, arr.shape[i] - (arr.shape[i] % factors[i]))
-            for i in range(arr.ndim)
-        )
-        return downscale_local_mean(arr[cropped], factors).astype(volume.dtype)
+    width = image_info["width"]
+    height = image_info["height"]
+    bands = image_info["bands"]
+    n_pages = image_info["n_pages"]
+    is_rgb = image_info["is_rgb"]
+    is_3d = n_pages > 1
+    pz, py, px = image_info["physical"]
 
-    current = volume
-    if initial_ds > 1:
-        for _ in range(int(np.log2(initial_ds))):
-            current = halve(current)
+    if chunking == "auto":
+        per_channel = not is_rgb
+    else:
+        per_channel = chunking == "per-channel"
 
-    levels = [current]
+    c_chunk = 1 if per_channel else bands
+
+    xy_unit = min(py, px) if min(py, px) > 0 else 1.0
+    z_ratio = pz / xy_unit
+
+    levels = []
+    level = 0
     while True:
-        if max_levels > 0 and len(levels) >= max_levels:
+        xy_shrink = initial_ds * (2 ** level)
+        lw = max(1, width // xy_shrink)
+        lh = max(1, height // xy_shrink)
+
+        if level > 0 and lw <= min_dim and lh <= min_dim:
             break
-        h, w = current.shape[1], current.shape[2]
-        if h <= min_dim and w <= min_dim:
+        if max_levels > 0 and level >= max_levels:
             break
-        current = halve(current)
-        levels.append(current)
+
+        if z_downsample:
+            z_shrink = xy_shrink
+            lz = max(1, n_pages // z_shrink)
+        else:
+            z_shrink = 1
+            lz = n_pages
+
+        if is_3d:
+            shape = (bands, lz, lh, lw)
+            chunks = (c_chunk, min(z_chunk_cfg, lz), tile_size, tile_size)
+            z_mult = float(xy_shrink) if z_downsample else 1.0
+            scale = [1.0, z_ratio * z_mult, float(xy_shrink), float(xy_shrink)]
+        else:
+            shape = (bands, lh, lw)
+            chunks = (c_chunk, tile_size, tile_size)
+            scale = [1.0, float(xy_shrink), float(xy_shrink)]
+
+        out_px = px * xy_shrink
+        out_py = py * xy_shrink
+        out_pz = pz * (xy_shrink if z_downsample else 1.0)
+
+        levels.append({
+            "level": level,
+            "xy_shrink": xy_shrink,
+            "z_shrink": z_shrink,
+            "shape": shape,
+            "chunks": chunks,
+            "scale": scale,
+            "lz": lz,
+            "lw": lw,
+            "lh": lh,
+            "out_physical": (out_pz, out_py, out_px),
+        })
+
+        level += 1
+        # Ensure we generate at least one level (level 0)
+        if lw <= min_dim and lh <= min_dim:
+            break
 
     return levels
 
 
-def write_ome_zarr(levels, out_path, config, initial_downsample,
-                   physical_sizes, z_downsampled, name=None, is_rgb=False):
-    """Write pyramid levels as an OME-Zarr (v3) dataset."""
-    tile_size = config["tile_size"]
-    chunking = config["channel_chunking"]
-    z_chunk_cfg = config["z_chunk"]
+def write_tiles(img, arr, z_index, tile_size, is_3d):
+    """Write one Z-plane of one pyramid level, tile by tile.
 
-    num_channels = levels[0].shape[3]
-    is_3d = levels[0].shape[0] > 1
-
-    if chunking == "auto":
-        per_channel = not is_rgb
-        log.info("  Auto channel chunking: %s (is_rgb=%s)",
-                 "bundled" if is_rgb else "per-channel", is_rgb)
+    Peak memory: one tile at a time (~256x256x3 = ~192KB for uint8 RGB).
+    """
+    if is_3d:
+        # arr shape: (C, Z, H, W)
+        height = arr.shape[2]
+        width = arr.shape[3]
     else:
-        per_channel = chunking == "per-channel"
+        # arr shape: (C, H, W)
+        height = arr.shape[1]
+        width = arr.shape[2]
 
-    codecs = [BloscCodec(cname="lz4", clevel=5, shuffle="shuffle")]
+    for ty in range(0, height, tile_size):
+        for tx in range(0, width, tile_size):
+            tw = min(tile_size, width - tx)
+            th = min(tile_size, height - ty)
+            tile = img.crop(tx, ty, tw, th)
+            tile_np = np.ndarray(
+                buffer=tile.write_to_memory(),
+                shape=(th, tw, tile.bands),
+                dtype=FORMAT_TO_DTYPE.get(tile.format, np.uint8),
+            )
+            # (H, W, C) → (C, H, W)
+            tile_np = tile_np.transpose(2, 0, 1)
+
+            if is_3d:
+                arr[:, z_index, ty:ty + th, tx:tx + tw] = tile_np
+            else:
+                arr[:, ty:ty + th, tx:tx + tw] = tile_np
+
+
+def average_z_pages(filepath, z_a, z_b, vips_format):
+    """Average two adjacent Z-pages lazily for Z-downsampling."""
+    page_a = pyvips.Image.new_from_file(
+        filepath, page=z_a, access="sequential"
+    )
+    page_b = pyvips.Image.new_from_file(
+        filepath, page=z_b, access="sequential"
+    )
+    avg = (page_a + page_b) / 2
+    return avg.cast(vips_format)
+
+
+def write_ome_zarr(image_info, pyramid_plan, out_path, config,
+                   z_downsampled, name=None):
+    """Write pyramid levels as an OME-Zarr (v3) dataset using pyvips streaming."""
+    tile_size = config["tile_size"]
+    compression = config["compression"]
+    compression_level = config["compression_level"]
+
+    filepath = image_info["filepath"]
+    bands = image_info["bands"]
+    is_rgb = image_info["is_rgb"]
+    dtype = image_info["dtype"]
+    vips_format = image_info["vips_format"]
+    n_pages = image_info["n_pages"]
+    physical = image_info["physical"]
+    is_3d = n_pages > 1
+
+    codecs = [BloscCodec(cname=compression, clevel=compression_level,
+                         shuffle="shuffle")]
 
     if os.path.exists(out_path):
         shutil.rmtree(out_path)
@@ -185,49 +311,53 @@ def write_ome_zarr(levels, out_path, config, initial_downsample,
     store = LocalStore(out_path)
     root = zarr.open_group(store, mode="w", zarr_format=3)
 
-    c_chunk = 1 if per_channel else num_channels
-    pz, py, px = physical_sizes
-    xy_unit = min(py, px) if min(py, px) > 0 else 1.0
-    z_ratio = pz / xy_unit
-
+    initial_ds = config["initial_downsample"]
     datasets = []
-    for i, level in enumerate(levels):
-        if is_3d:
-            data = level.transpose(3, 0, 1, 2)  # (Z,Y,X,C) → (C,Z,Y,X)
-            chunks = (c_chunk, min(z_chunk_cfg, data.shape[1]),
-                      tile_size, tile_size)
-        else:
-            data = level.transpose(3, 0, 1, 2).squeeze(1)  # → (C,Y,X)
-            chunks = (c_chunk, tile_size, tile_size)
 
-        root.create_array(
-            str(i),
-            data=data,
+    for plan in pyramid_plan:
+        level = plan["level"]
+        shape = plan["shape"]
+        chunks = plan["chunks"]
+        scale = plan["scale"]
+        xy_shrink = plan["xy_shrink"]
+        z_shrink = plan["z_shrink"]
+        lz = plan["lz"]
+        out_phys = plan["out_physical"]
+
+        arr = root.create_array(
+            str(level),
+            shape=shape,
             chunks=chunks,
+            dtype=dtype,
             compressors=codecs,
             overwrite=True,
         )
 
-        xy_scale = float(initial_downsample * (2 ** i))
-        z_mult = xy_scale if z_downsampled else 1.0
-        if is_3d:
-            scale = [1.0, z_ratio * z_mult, xy_scale, xy_scale]
-        else:
-            scale = [1.0, xy_scale, xy_scale]
+        for zi in range(lz):
+            src_z = zi * z_shrink
+
+            if z_downsampled and z_shrink > 1 and src_z + 1 < n_pages:
+                img = average_z_pages(filepath, src_z, src_z + 1, vips_format)
+            else:
+                img = pyvips.Image.new_from_file(
+                    filepath, page=src_z, access="sequential"
+                )
+
+            if xy_shrink > 1:
+                img = img.shrink(xy_shrink, xy_shrink)
+
+            write_tiles(img, arr, zi, tile_size, is_3d)
 
         datasets.append({
-            "path": str(i),
+            "path": str(level),
             "coordinateTransformations": [{"type": "scale", "scale": scale}],
         })
 
-        out_px = px * xy_scale
-        out_py = py * xy_scale
-        out_pz = pz * z_mult
         log.info(
             "  Level %d: shape=%s chunks=%s (XY %.0fx) "
             "voxel µm (z,y,x): (%.4f, %.4f, %.4f) scale=%s",
-            i, data.shape, chunks, xy_scale,
-            out_pz, out_py, out_px, scale,
+            level, shape, chunks, float(xy_shrink),
+            out_phys[0], out_phys[1], out_phys[2], scale,
         )
 
     if is_3d:
@@ -252,13 +382,13 @@ def write_ome_zarr(levels, out_path, config, initial_downsample,
         "type": "gaussian",
         "metadata": {
             "description": (
-                f"Pyramid with initial_downsample={initial_downsample}, "
+                f"Pyramid with initial_downsample={initial_ds}, "
                 f"z_downsampled={z_downsampled}."
             ),
         },
     }]
 
-    if num_channels == 3:
+    if bands == 3:
         root.attrs["omero"] = {
             "channels": [
                 {"color": "FF0000", "label": "R", "active": True,
@@ -285,23 +415,29 @@ def process_file(filepath, output_dir, config):
             zarr_name = basename[: len(basename) - len(ext)]
             break
 
-    log.info("Reading image...")
-    volume, physical, is_rgb = read_volume(filepath)
-    z_ds = choose_z_downsample(config["z_downsample"], physical)
+    log.info("Opening image (lazy)...")
+    image_info = open_image(filepath)
+
+    z_ds = choose_z_downsample(config["z_downsample"], image_info["physical"])
+    is_3d = image_info["n_pages"] > 1
+
     log.info(
-        "  Volume (Z,Y,X,C): %s, dtype: %s, photometric: %s, "
+        "  Image: %dx%d, %d bands, %d pages, dtype: %s, photometric: %s, "
         "physical (z,y,x) µm: %s, z_downsample: %s",
-        volume.shape, volume.dtype,
-        "RGB" if is_rgb else "grayscale", physical, z_ds,
+        image_info["width"], image_info["height"],
+        image_info["bands"], image_info["n_pages"],
+        image_info["dtype"].__name__,
+        "RGB" if image_info["is_rgb"] else "grayscale",
+        image_info["physical"], z_ds,
     )
 
-    log.info("Building pyramid levels...")
-    levels = build_pyramid_levels(volume, config, z_ds)
-    log.info("  Generated %d levels", len(levels))
+    log.info("Computing pyramid plan...")
+    pyramid_plan = compute_pyramid_plan(image_info, config, z_ds)
+    log.info("  Planned %d levels", len(pyramid_plan))
 
-    log.info("Writing OME-Zarr to %s", out_path)
-    write_ome_zarr(levels, out_path, config, config["initial_downsample"],
-                   physical, z_ds, name=zarr_name, is_rgb=is_rgb)
+    log.info("Writing OME-Zarr to %s (streaming tiles)...", out_path)
+    write_ome_zarr(image_info, pyramid_plan, out_path, config,
+                   z_ds, name=zarr_name)
     log.info("Done: %s", out_path)
 
 

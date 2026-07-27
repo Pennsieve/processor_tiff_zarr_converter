@@ -1,5 +1,4 @@
 awslambdaric
-tifffile
+pyvips>=2.2.1
 zarr>=3
-scikit-image
 numpy

@@ -5,3 +5,7 @@ data/input/*
 data/output/*
 !data/output/.gitkeep
 .env
+.DS_Store
+.venv/
+test_input/
+test_output/
