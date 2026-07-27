@@ -18,6 +18,8 @@ import shutil
 
 import numpy as np
 import pyvips
+pyvips.cache_set_max(0)
+logging.getLogger("pyvips").setLevel(logging.WARNING)
 import zarr
 from zarr.codecs import BloscCodec
 from zarr.storage import LocalStore
@@ -274,17 +276,6 @@ def write_tiles(img, arr, z_index, tile_size, is_3d):
                 arr[:, ty:ty + th, tx:tx + tw] = tile_np
 
 
-def average_z_pages(filepath, z_a, z_b, vips_format):
-    """Average two adjacent Z-pages lazily for Z-downsampling."""
-    page_a = pyvips.Image.new_from_file(
-        filepath, page=z_a, access="sequential"
-    )
-    page_b = pyvips.Image.new_from_file(
-        filepath, page=z_b, access="sequential"
-    )
-    avg = (page_a + page_b) / 2
-    return avg.cast(vips_format)
-
 
 def write_ome_zarr(image_info, pyramid_plan, out_path, config,
                    z_downsampled, name=None):
@@ -314,6 +305,22 @@ def write_ome_zarr(image_info, pyramid_plan, out_path, config,
     initial_ds = config["initial_downsample"]
     datasets = []
 
+    # Pre-open source pages with random access so pyvips can reuse them
+    # across pyramid levels without re-reading the entire file each time.
+    src_pages = {}
+    unique_pages = set()
+    for plan in pyramid_plan:
+        z_shrink = plan["z_shrink"]
+        for zi in range(plan["lz"]):
+            src_z = zi * z_shrink
+            unique_pages.add(src_z)
+            if z_downsampled and z_shrink > 1 and src_z + 1 < n_pages:
+                unique_pages.add(src_z + 1)
+    for page_idx in sorted(unique_pages):
+        src_pages[page_idx] = pyvips.Image.new_from_file(
+            filepath, page=page_idx, access="random"
+        )
+
     for plan in pyramid_plan:
         level = plan["level"]
         shape = plan["shape"]
@@ -337,11 +344,10 @@ def write_ome_zarr(image_info, pyramid_plan, out_path, config,
             src_z = zi * z_shrink
 
             if z_downsampled and z_shrink > 1 and src_z + 1 < n_pages:
-                img = average_z_pages(filepath, src_z, src_z + 1, vips_format)
+                avg = (src_pages[src_z] + src_pages[src_z + 1]) / 2
+                img = avg.cast(vips_format)
             else:
-                img = pyvips.Image.new_from_file(
-                    filepath, page=src_z, access="sequential"
-                )
+                img = src_pages[src_z]
 
             if xy_shrink > 1:
                 img = img.shrink(xy_shrink, xy_shrink)
