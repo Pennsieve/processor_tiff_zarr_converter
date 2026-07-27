@@ -398,7 +398,7 @@ def write_ome_zarr(image_info, pyramid_plan, out_path, config,
                 {"color": "0000FF", "label": "B", "active": True,
                  "window": {"start": 0, "end": 255}},
             ],
-            "rdefs": {"model": "color"},
+            "rdefs": {"model": "fluorescence"},
         }
 
 
