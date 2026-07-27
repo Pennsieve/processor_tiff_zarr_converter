@@ -55,6 +55,7 @@ def get_config():
         "channel_chunking": os.environ.get("CHANNEL_CHUNKING", "auto"),
         "z_downsample": os.environ.get("Z_DOWNSAMPLE", "auto"),
         "z_chunk": int(os.environ.get("Z_CHUNK", "16")),
+        "rgb_mode": os.environ.get("RGB_MODE", "combined"),
     }
 
 
@@ -397,14 +398,14 @@ def write_ome_zarr(image_info, pyramid_plan, out_path, config,
     if bands == 3:
         root.attrs["omero"] = {
             "channels": [
-                {"color": "FF0000", "label": "R", "active": True,
+                {"color": "FF6699", "label": "R", "active": True,
                  "window": {"start": 0, "end": 255}},
                 {"color": "00FF00", "label": "G", "active": True,
                  "window": {"start": 0, "end": 255}},
-                {"color": "0000FF", "label": "B", "active": True,
+                {"color": "6699FF", "label": "B", "active": True,
                  "window": {"start": 0, "end": 255}},
             ],
-            "rdefs": {"model": "fluorescence"},
+            "rdefs": {"model": "color" if config.get("rgb_mode") == "combined" else "fluorescence"},
         }
 
 
