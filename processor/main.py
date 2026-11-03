@@ -15,6 +15,7 @@ import re
 import sys
 import logging
 import shutil
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pyvips
@@ -100,6 +101,70 @@ def _parse_physical_sizes(ome_xml):
     return (pz, py, px), {"z": fz, "y": fy, "x": fx}
 
 
+FALLBACK_CHANNEL_COLORS = ["00FF00", "FF00FF", "00FFFF", "FF0000", "0000FF", "FFFF00"]
+
+
+def ome_color_to_hex(value):
+    """Convert an OME Color attribute (signed 32-bit RGBA int) to 'RRGGBB'."""
+    try:
+        u = int(value) & 0xFFFFFFFF
+    except (TypeError, ValueError):
+        return None
+    return f"{(u >> 24) & 255:02X}{(u >> 16) & 255:02X}{(u >> 8) & 255:02X}"
+
+
+def parse_ome_pixels(ome_xml):
+    """Read the dimension layout and channel metadata from OME-XML.
+
+    Returns None if the description isn't OME-XML (e.g. ImageJ or plain TIFF).
+    """
+    if not ome_xml or "<OME" not in ome_xml:
+        return None
+    try:
+        root = ET.fromstring(ome_xml)
+    except ET.ParseError:
+        log.warning("  Image description looks like OME-XML but could not be parsed")
+        return None
+    pixels = root.find(".//{*}Pixels")
+    if pixels is None:
+        return None
+
+    def size(key):
+        try:
+            return max(1, int(pixels.get(key, "1")))
+        except ValueError:
+            return 1
+
+    channels = [
+        {
+            "name": ch.get("Name") or ch.get("Fluor"),
+            "color": ome_color_to_hex(ch.get("Color")) if ch.get("Color") else None,
+        }
+        for ch in pixels.findall("{*}Channel")
+    ]
+    return {
+        "size_c": size("SizeC"),
+        "size_z": size("SizeZ"),
+        "size_t": size("SizeT"),
+        "dimension_order": pixels.get("DimensionOrder", "XYCZT").upper(),
+        "channels": channels,
+    }
+
+
+def ome_page_index(dimension_order, c, z, t, size_c, size_z, size_t):
+    """TIFF page holding plane (c, z, t), per OME DimensionOrder.
+
+    In e.g. "XYCZT" the letter after XY varies fastest: pages go c0z0, c1z0, c0z1, ...
+    """
+    sizes = {"C": size_c, "Z": size_z, "T": size_t}
+    index = {"C": c, "Z": z, "T": t}
+    page, stride = 0, 1
+    for dim in dimension_order[2:]:
+        page += index[dim] * stride
+        stride *= sizes[dim]
+    return page
+
+
 def choose_z_downsample(mode, physical_sizes):
     pz, py, px = physical_sizes
     if mode == "isotropic":
@@ -147,12 +212,48 @@ def open_image(filepath):
     vips_format = img.format
     dtype = FORMAT_TO_DTYPE.get(vips_format, np.uint8)
 
+    # Work out how channels and Z planes are laid out across TIFF pages.
+    # Default (RGB, plain TIFF, single-channel stacks): every page is one Z
+    # plane and channels are the bands within a page.
+    ome = parse_ome_pixels(ome_xml)
+    size_c, size_z = bands, n_pages
+    page_map = {(None, z): z for z in range(n_pages)}
+    planar_channels = False
+    if ome and not is_rgb and bands == 1 and ome["size_c"] > 1:
+        expected = ome["size_c"] * ome["size_z"] * ome["size_t"]
+        if n_pages == expected:
+            planar_channels = True
+            size_c, size_z = ome["size_c"], ome["size_z"]
+            if ome["size_t"] > 1:
+                log.warning("  SizeT=%d; only the first timepoint is converted", ome["size_t"])
+            page_map = {
+                (c, z): ome_page_index(ome["dimension_order"], c, z, 0,
+                                       ome["size_c"], ome["size_z"], ome["size_t"])
+                for c in range(size_c) for z in range(size_z)
+            }
+            log.info(
+                "  OME multichannel: SizeC=%d SizeZ=%d DimensionOrder=%s, one page per plane",
+                size_c, size_z, ome["dimension_order"],
+            )
+        else:
+            log.warning(
+                "  OME says SizeC=%d SizeZ=%d SizeT=%d (%d planes) but the file has %d pages; "
+                "treating pages as Z", ome["size_c"], ome["size_z"], ome["size_t"], expected, n_pages,
+            )
+
+    channel_meta = (ome or {}).get("channels", [])
+
     return {
         "filepath": filepath,
         "width": width,
         "height": height,
         "bands": bands,
         "n_pages": n_pages,
+        "size_c": size_c,
+        "size_z": size_z,
+        "planar_channels": planar_channels,
+        "page_map": page_map,
+        "channel_meta": channel_meta,
         "is_rgb": is_rgb,
         "physical": physical,
         "dtype": dtype,
@@ -174,8 +275,8 @@ def compute_pyramid_plan(image_info, config, z_downsample):
 
     width = image_info["width"]
     height = image_info["height"]
-    bands = image_info["bands"]
-    n_pages = image_info["n_pages"]
+    bands = image_info["size_c"]
+    n_pages = image_info["size_z"]
     is_rgb = image_info["is_rgb"]
     is_3d = n_pages > 1
     pz, py, px = image_info["physical"]
@@ -244,11 +345,14 @@ def compute_pyramid_plan(image_info, config, z_downsample):
     return levels
 
 
-def write_tiles(img, arr, z_index, tile_size, is_3d):
+def write_tiles(img, arr, z_index, tile_size, is_3d, channel=None):
     """Write one Z-plane of one pyramid level, tile by tile.
 
+    channel=None writes all of img's bands (RGB / interleaved); an int writes
+    img's single band into that channel (planar OME multichannel).
     Peak memory: one tile at a time (~256x256x3 = ~192KB for uint8 RGB).
     """
+    c_slice = slice(None) if channel is None else slice(channel, channel + 1)
     if is_3d:
         # arr shape: (C, Z, H, W)
         height = arr.shape[2]
@@ -272,9 +376,9 @@ def write_tiles(img, arr, z_index, tile_size, is_3d):
             tile_np = tile_np.transpose(2, 0, 1)
 
             if is_3d:
-                arr[:, z_index, ty:ty + th, tx:tx + tw] = tile_np
+                arr[c_slice, z_index, ty:ty + th, tx:tx + tw] = tile_np
             else:
-                arr[:, ty:ty + th, tx:tx + tw] = tile_np
+                arr[c_slice, ty:ty + th, tx:tx + tw] = tile_np
 
 
 
@@ -286,13 +390,15 @@ def write_ome_zarr(image_info, pyramid_plan, out_path, config,
     compression_level = config["compression_level"]
 
     filepath = image_info["filepath"]
-    bands = image_info["bands"]
-    is_rgb = image_info["is_rgb"]
     dtype = image_info["dtype"]
     vips_format = image_info["vips_format"]
-    n_pages = image_info["n_pages"]
-    physical = image_info["physical"]
+    n_pages = image_info["size_z"]
+    page_map = image_info["page_map"]
     is_3d = n_pages > 1
+    # Planar multichannel: each channel is its own page. Otherwise a page
+    # carries all channels as bands (key None).
+    channel_keys = (list(range(image_info["size_c"]))
+                    if image_info["planar_channels"] else [None])
 
     codecs = [BloscCodec(cname=compression, clevel=compression_level,
                          shuffle="shuffle")]
@@ -314,9 +420,10 @@ def write_ome_zarr(image_info, pyramid_plan, out_path, config,
         z_shrink = plan["z_shrink"]
         for zi in range(plan["lz"]):
             src_z = zi * z_shrink
-            unique_pages.add(src_z)
-            if z_downsampled and z_shrink > 1 and src_z + 1 < n_pages:
-                unique_pages.add(src_z + 1)
+            for ck in channel_keys:
+                unique_pages.add(page_map[(ck, src_z)])
+                if z_downsampled and z_shrink > 1 and src_z + 1 < n_pages:
+                    unique_pages.add(page_map[(ck, src_z + 1)])
     for page_idx in sorted(unique_pages):
         src_pages[page_idx] = pyvips.Image.new_from_file(
             filepath, page=page_idx, access="random"
@@ -344,16 +451,18 @@ def write_ome_zarr(image_info, pyramid_plan, out_path, config,
         for zi in range(lz):
             src_z = zi * z_shrink
 
-            if z_downsampled and z_shrink > 1 and src_z + 1 < n_pages:
-                avg = (src_pages[src_z] + src_pages[src_z + 1]) / 2
-                img = avg.cast(vips_format)
-            else:
-                img = src_pages[src_z]
+            for ck in channel_keys:
+                page = src_pages[page_map[(ck, src_z)]]
+                if z_downsampled and z_shrink > 1 and src_z + 1 < n_pages:
+                    nxt = src_pages[page_map[(ck, src_z + 1)]]
+                    img = ((page + nxt) / 2).cast(vips_format)
+                else:
+                    img = page
 
-            if xy_shrink > 1:
-                img = img.shrink(xy_shrink, xy_shrink)
+                if xy_shrink > 1:
+                    img = img.shrink(xy_shrink, xy_shrink)
 
-            write_tiles(img, arr, zi, tile_size, is_3d)
+                write_tiles(img, arr, zi, tile_size, is_3d, channel=ck)
 
         datasets.append({
             "path": str(level),
@@ -395,8 +504,24 @@ def write_ome_zarr(image_info, pyramid_plan, out_path, config,
         },
     }]
 
-    if bands == 3:
-        root.attrs["omero"] = {
+    smallest = root[datasets[-1]["path"]]
+    omero = build_omero(image_info, smallest, config)
+    if omero:
+        root.attrs["omero"] = omero
+
+
+def build_omero(image_info, smallest_level, config):
+    """OMERO rendering metadata: channel colors, labels and display windows.
+
+    RGB keeps the fixed R/G/B block (the viewer and thumbnail processor detect
+    RGB from it). Planar OME multichannel images get one entry per channel,
+    with the color and name from the OME-XML and a contrast window from the
+    smallest pyramid level, so the viewer shows them as colored overlays.
+    """
+    if not image_info["planar_channels"]:
+        if image_info["size_c"] != 3:
+            return None
+        return {
             "channels": [
                 {"color": "FF6699", "label": "R", "active": True,
                  "window": {"start": 0, "end": 255}},
@@ -407,6 +532,46 @@ def write_ome_zarr(image_info, pyramid_plan, out_path, config,
             ],
             "rdefs": {"model": "color" if config.get("rgb_mode") == "combined" else "fluorescence"},
         }
+
+    size_c = image_info["size_c"]
+    meta = image_info["channel_meta"]
+    colors = [(meta[c].get("color") if c < len(meta) else None) for c in range(size_c)]
+    # Black is invisible as an overlay, and identical colors (often all white)
+    # can't be told apart, so fall back to a distinct palette in those cases.
+    if any(col in (None, "000000") for col in colors) or len(set(colors)) < size_c:
+        log.info("  OME channel colors missing or not distinct (%s); using fallback palette", colors)
+        colors = [FALLBACK_CHANNEL_COLORS[c % len(FALLBACK_CHANNEL_COLORS)] for c in range(size_c)]
+
+    dtype = np.dtype(image_info["dtype"])
+    if np.issubdtype(dtype, np.integer):
+        dmin, dmax = int(np.iinfo(dtype).min), int(np.iinfo(dtype).max)
+    else:
+        dmin, dmax = 0.0, 1.0
+
+    is_3d = smallest_level.ndim == 4
+    channels = []
+    for c in range(size_c):
+        if is_3d:
+            nz = smallest_level.shape[1]
+            values = np.asarray(smallest_level[c, ::max(1, nz // 16)])
+        else:
+            values = np.asarray(smallest_level[c])
+        lo, hi = (np.percentile(values, [0.1, 99.9]) if values.size else (dmin, dmax))
+        lo, hi = float(lo), float(hi)
+        if hi <= lo:
+            hi = lo + 1
+        name = meta[c].get("name") if c < len(meta) else None
+        channels.append({
+            "color": colors[c],
+            "label": name or f"Channel {c + 1}",
+            "active": True,
+            "window": {"min": dmin, "max": dmax, "start": lo, "end": hi},
+        })
+        log.info("  Channel %d '%s': color #%s window [%g, %g]",
+                 c, channels[-1]["label"], colors[c], lo, hi)
+
+    # No rdefs.model here: the viewer reads model "color" with 3 channels as RGB.
+    return {"channels": channels}
 
 
 def process_file(filepath, output_dir, config):
@@ -426,15 +591,20 @@ def process_file(filepath, output_dir, config):
     image_info = open_image(filepath)
 
     z_ds = choose_z_downsample(config["z_downsample"], image_info["physical"])
-    is_3d = image_info["n_pages"] > 1
+    if image_info["is_rgb"]:
+        layout = "RGB"
+    elif image_info["planar_channels"]:
+        layout = "multichannel (one page per channel)"
+    else:
+        layout = "grayscale"
 
     log.info(
-        "  Image: %dx%d, %d bands, %d pages, dtype: %s, photometric: %s, "
-        "physical (z,y,x) µm: %s, z_downsample: %s",
+        "  Image: %dx%d, %d bands, %d pages -> %d channels, %d z, dtype: %s, "
+        "layout: %s, physical (z,y,x) µm: %s, z_downsample: %s",
         image_info["width"], image_info["height"],
         image_info["bands"], image_info["n_pages"],
-        image_info["dtype"].__name__,
-        "RGB" if image_info["is_rgb"] else "grayscale",
+        image_info["size_c"], image_info["size_z"],
+        image_info["dtype"].__name__, layout,
         image_info["physical"], z_ds,
     )
 
