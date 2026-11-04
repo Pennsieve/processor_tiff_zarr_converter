@@ -9,6 +9,17 @@ Pennsieve processor that converts OME-TIFF files to multi-resolution OME-Zarr py
 - Writes OME-Zarr v0.4 (Zarr v3) datasets to `OUTPUT_DIR`
 - Per-channel chunking for independent channel access in viewers
 - Blosc/zstd compression for efficient storage and serving
+- Multichannel OME-TIFFs that store one page per channel (typical fluorescence/confocal exports) are read using the OME-XML `SizeC`, `SizeZ` and `DimensionOrder`, so channels go on the `c` axis rather than being mistaken for Z slices
+
+## Image layouts
+
+| Layout | Detected by | Output |
+|---|---|---|
+| RGB (brightfield) | TIFF photometric RGB, 3 samples per pixel | `c=3`, fixed R/G/B `omero` block with `rdefs.model` from `RGB_MODE` |
+| Multichannel, one page per channel | OME-XML `SizeC > 1` and page count = `SizeC × SizeZ × SizeT` | `c=SizeC`, `z=SizeZ`; `omero` channels with the OME `Color` and `Name`, and a contrast window from the 0.1–99.9th percentile of the smallest level |
+| Single channel / plain TIFF | anything else | each page is a Z slice; no `omero` block (shown in grayscale) |
+
+For multichannel images, the OME colors are kept; only a channel whose color is missing, black, or repeats an earlier channel gets a fallback color not already in use. Only the first timepoint is converted when `SizeT > 1`. No `rdefs.model` is written for multichannel images, because viewers treat `model: "color"` with three channels as RGB.
 
 ## Environment Variables
 
@@ -56,7 +67,7 @@ image.ome.zarr/
 
 Metadata includes:
 - **multiscales**: OME-Zarr v0.4 with `coordinateTransformations` encoding scale relative to the original full-resolution image
-- **omero**: RGB channel rendering hints (for 3-channel images)
+- **omero**: channel rendering hints: fixed R/G/B for RGB images, or per-channel colors, names and windows from the OME-XML for multichannel images
 
 ## Dual-Mode Support
 
