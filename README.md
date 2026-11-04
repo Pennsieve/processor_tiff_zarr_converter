@@ -19,7 +19,7 @@ Pennsieve processor that converts OME-TIFF files to multi-resolution OME-Zarr py
 | Multichannel, one page per channel | OME-XML `SizeC > 1` and page count = `SizeC × SizeZ × SizeT` | `c=SizeC`, `z=SizeZ`; `omero` channels with the OME `Color` and `Name`, and a contrast window from the 0.1–99.9th percentile of the smallest level |
 | Single channel / plain TIFF | anything else | each page is a Z slice; no `omero` block (shown in grayscale) |
 
-For multichannel images, if the OME colors are missing, black, or not distinct, a fallback palette is used. Only the first timepoint is converted when `SizeT > 1`. No `rdefs.model` is written for multichannel images, because viewers treat `model: "color"` with three channels as RGB.
+For multichannel images, the OME colors are kept; only a channel whose color is missing, black, or repeats an earlier channel gets a fallback color not already in use. Only the first timepoint is converted when `SizeT > 1`. No `rdefs.model` is written for multichannel images, because viewers treat `model: "color"` with three channels as RGB.
 
 ## Environment Variables
 

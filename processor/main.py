@@ -536,11 +536,22 @@ def build_omero(image_info, smallest_level, config):
     size_c = image_info["size_c"]
     meta = image_info["channel_meta"]
     colors = [(meta[c].get("color") if c < len(meta) else None) for c in range(size_c)]
-    # Black is invisible as an overlay, and identical colors (often all white)
-    # can't be told apart, so fall back to a distinct palette in those cases.
-    if any(col in (None, "000000") for col in colors) or len(set(colors)) < size_c:
-        log.info("  OME channel colors missing or not distinct (%s); using fallback palette", colors)
-        colors = [FALLBACK_CHANNEL_COLORS[c % len(FALLBACK_CHANNEL_COLORS)] for c in range(size_c)]
+    # Black is invisible as an overlay, and a repeated color (often all white)
+    # can't be told apart, so only those channels get a fallback color, one
+    # not already used by another channel. Good OME colors are kept.
+    original = list(colors)
+    seen = set()
+    for c, col in enumerate(colors):
+        if col in (None, "000000") or col in seen:
+            colors[c] = None
+        else:
+            seen.add(col)
+    spare = [col for col in FALLBACK_CHANNEL_COLORS if col not in seen]
+    for c in range(size_c):
+        if colors[c] is None:
+            colors[c] = spare.pop(0) if spare else FALLBACK_CHANNEL_COLORS[c % len(FALLBACK_CHANNEL_COLORS)]
+    if colors != original:
+        log.info("  Replaced missing/black/duplicate OME colors: %s -> %s", original, colors)
 
     dtype = np.dtype(image_info["dtype"])
     if np.issubdtype(dtype, np.integer):
