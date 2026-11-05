@@ -345,41 +345,38 @@ def compute_pyramid_plan(image_info, config, z_downsample):
     return levels
 
 
-def write_tiles(img, arr, z_index, tile_size, is_3d, channel=None):
-    """Write one Z-plane of one pyramid level, tile by tile.
+def write_strips(imgs, arr, z0, tile_size, is_3d, channel=None):
+    """Write consecutive Z-planes of one pyramid level, one row of tiles at a time.
 
-    channel=None writes all of img's bands (RGB / interleaved); an int writes
-    img's single band into that channel (planar OME multichannel).
-    Peak memory: one tile at a time (~256x256x3 = ~192KB for uint8 RGB).
+    imgs are the planes for slices z0, z0+1, ... (a single plane for 2D). Each
+    write covers whole chunks (all of their slices, a full row of tiles), so no
+    chunk is written twice. channel=None writes all of a plane's bands (RGB /
+    interleaved); an int writes its single band into that channel (planar OME
+    multichannel). Peak memory: one row of tiles per plane, e.g. 256 rows x
+    26k px x 16 slices x 2 bytes = ~210 MB for a large 16-bit stack.
     """
     c_slice = slice(None) if channel is None else slice(channel, channel + 1)
-    if is_3d:
-        # arr shape: (C, Z, H, W)
-        height = arr.shape[2]
-        width = arr.shape[3]
-    else:
-        # arr shape: (C, H, W)
-        height = arr.shape[1]
-        width = arr.shape[2]
+    height, width = arr.shape[-2], arr.shape[-1]
+    dtype = FORMAT_TO_DTYPE.get(imgs[0].format, np.uint8)
 
     for ty in range(0, height, tile_size):
-        for tx in range(0, width, tile_size):
-            tw = min(tile_size, width - tx)
-            th = min(tile_size, height - ty)
-            tile = img.crop(tx, ty, tw, th)
-            tile_np = np.ndarray(
-                buffer=tile.write_to_memory(),
-                shape=(th, tw, tile.bands),
-                dtype=FORMAT_TO_DTYPE.get(tile.format, np.uint8),
-            )
-            # (H, W, C) → (C, H, W)
-            tile_np = tile_np.transpose(2, 0, 1)
+        th = min(tile_size, height - ty)
+        rows = []
+        for img in imgs:
+            strip = img.crop(0, ty, width, th)
+            # (H, W, C) -> (C, H, W)
+            rows.append(np.ndarray(
+                buffer=strip.write_to_memory(),
+                shape=(th, width, strip.bands),
+                dtype=dtype,
+            ).transpose(2, 0, 1))
 
-            if is_3d:
-                arr[c_slice, z_index, ty:ty + th, tx:tx + tw] = tile_np
-            else:
-                arr[c_slice, ty:ty + th, tx:tx + tw] = tile_np
-
+        if is_3d:
+            # arr shape: (C, Z, H, W); stack the planes on the Z axis
+            arr[c_slice, z0:z0 + len(rows), ty:ty + th, :] = np.stack(rows, axis=1)
+        else:
+            # arr shape: (C, H, W)
+            arr[c_slice, ty:ty + th, :] = rows[0]
 
 
 def write_ome_zarr(image_info, pyramid_plan, out_path, config,
@@ -448,21 +445,28 @@ def write_ome_zarr(image_info, pyramid_plan, out_path, config,
             overwrite=True,
         )
 
-        for zi in range(lz):
+        def plane(ck, zi):
+            """The source plane for output slice zi, shrunk to this level."""
             src_z = zi * z_shrink
+            page = src_pages[page_map[(ck, src_z)]]
+            if z_downsampled and z_shrink > 1 and src_z + 1 < n_pages:
+                nxt = src_pages[page_map[(ck, src_z + 1)]]
+                img = ((page + nxt) / 2).cast(vips_format)
+            else:
+                img = page
+            if xy_shrink > 1:
+                img = img.shrink(xy_shrink, xy_shrink)
+            return img
 
+        # Write one Z-chunk's worth of slices at a time, so every chunk is
+        # written exactly once instead of once per slice (each partial write
+        # is a read-decompress-recompress-write, slow on network storage).
+        z_step = chunks[1] if is_3d else 1
+        for z0 in range(0, lz, z_step):
+            z1 = min(z0 + z_step, lz)
             for ck in channel_keys:
-                page = src_pages[page_map[(ck, src_z)]]
-                if z_downsampled and z_shrink > 1 and src_z + 1 < n_pages:
-                    nxt = src_pages[page_map[(ck, src_z + 1)]]
-                    img = ((page + nxt) / 2).cast(vips_format)
-                else:
-                    img = page
-
-                if xy_shrink > 1:
-                    img = img.shrink(xy_shrink, xy_shrink)
-
-                write_tiles(img, arr, zi, tile_size, is_3d, channel=ck)
+                imgs = [plane(ck, zi) for zi in range(z0, z1)]
+                write_strips(imgs, arr, z0, tile_size, is_3d, channel=ck)
 
         datasets.append({
             "path": str(level),
