@@ -38,11 +38,11 @@ For multichannel images, the OME colors are kept; only a channel whose color is 
 | `REGION` | Container override | Lambda config | AWS region |
 | `DEPLOYMENT_MODE` | Container override | Lambda config | Security scope (basic/secure/compliant) |
 
-### Processor Parameters (set on Lambda config or container override)
+### Processor Parameters (set on Lambda config or container override; the ones in `app.yml` can be set on the workflow node)
 
 | Variable | Default | Description |
 |---|---|---|
-| `INITIAL_DOWNSAMPLE` | `2` | Initial downsample factor. `1` = include full resolution, `2` = start from 2x downsampled, `4` = start from 4x, etc. Must be a power of 2. |
+| `INITIAL_DOWNSAMPLE` | `1` | Initial downsample factor. `1` = include full resolution (default), `2` = start from 2x downsampled, `4` = start from 4x, etc. Must be a power of 2. |
 | `TILE_SIZE` | `256` | Chunk/tile size in pixels (both x and y). Standard for web tile viewers. |
 | `COMPRESSION` | `zstd` | Blosc compression algorithm (`zstd`, `lz4`, `lz4hc`, `zlib`, `snappy`) |
 | `COMPRESSION_LEVEL` | `5` | Compression level (1-9, higher = smaller but slower) |

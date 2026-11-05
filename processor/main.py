@@ -47,7 +47,7 @@ def get_config():
     return {
         "input_dir": os.environ.get("INPUT_DIR", ""),
         "output_dir": os.environ.get("OUTPUT_DIR", ""),
-        "initial_downsample": int(os.environ.get("INITIAL_DOWNSAMPLE", "2")),
+        "initial_downsample": int(os.environ.get("INITIAL_DOWNSAMPLE", "1")),
         "tile_size": int(os.environ.get("TILE_SIZE", "256")),
         "compression": os.environ.get("COMPRESSION", "zstd"),
         "compression_level": int(os.environ.get("COMPRESSION_LEVEL", "5")),

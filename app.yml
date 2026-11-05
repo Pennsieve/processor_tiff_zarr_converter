@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=https://schemas.pennsieve.io/app-manifest/v1.json
+application:
+  name: OME-TIFF to OME-Zarr Converter
+  description: Converts an OME-TIFF into a multiscale OME-Zarr pyramid (with channel colors) for the Pennsieve image viewer
+  type: processor
+  tags:
+    - visualization
+    - microscopy
+runtime:
+  # Fargate: 8 vCPU allows 16-60 GB. Large 16-bit stacks need the memory headroom.
+  cpu: 8192
+  memory: 61440
+  computeTypes:
+    - standard
+parameters:
+  - name: INITIAL_DOWNSAMPLE
+    type: string
+    description: Downsample factor for the top pyramid level. 1 keeps full resolution; 2 halves width and height, and so on
+    defaultValue: "1"
+    validValues: ["1", "2", "4", "8"]
+  - name: Z_DOWNSAMPLE
+    type: string
+    description: Downsample Z with X and Y in lower levels. auto does it only when voxels are near-isotropic (Z spacing at most 2x the pixel size)
+    defaultValue: auto
+    validValues: ["auto", "isotropic", "none"]
+  - name: MIN_DIMENSION
+    type: number
+    description: Stop adding pyramid levels once width and height are both at or below this many pixels
+    defaultValue: "256"
+  - name: MAX_LEVELS
+    type: number
+    description: Maximum number of pyramid levels (0 = as many as MIN_DIMENSION allows)
+    defaultValue: "0"
