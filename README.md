@@ -38,7 +38,7 @@ For multichannel images, the OME colors are kept; only a channel whose color is 
 | `REGION` | Container override | Lambda config | AWS region |
 | `DEPLOYMENT_MODE` | Container override | Lambda config | Security scope (basic/secure/compliant) |
 
-### Processor Parameters (set on Lambda config or container override)
+### Processor Parameters (set on Lambda config or container override; the ones in `app.yml` can be set on the workflow node)
 
 | Variable | Default | Description |
 |---|---|---|
