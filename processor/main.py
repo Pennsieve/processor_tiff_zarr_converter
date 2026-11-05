@@ -517,8 +517,12 @@ def build_omero(image_info, smallest_level, config):
     RGB from it). Planar OME multichannel images get one entry per channel,
     with the color and name from the OME-XML and a contrast window from the
     smallest pyramid level, so the viewer shows them as colored overlays.
+    A single-channel image gets one such entry when the OME-XML gives it a
+    color other than white, so it shows in that color instead of gray.
     """
     if not image_info["planar_channels"]:
+        if image_info["size_c"] == 1 and not image_info["is_rgb"]:
+            return _single_channel_omero(image_info, smallest_level)
         if image_info["size_c"] != 3:
             return None
         return {
@@ -553,36 +557,53 @@ def build_omero(image_info, smallest_level, config):
     if colors != original:
         log.info("  Replaced missing/black/duplicate OME colors: %s -> %s", original, colors)
 
+    channels = [_omero_channel(image_info, smallest_level, c, colors[c])
+                for c in range(size_c)]
+    # No rdefs.model here: the viewer reads model "color" with 3 channels as RGB.
+    return {"channels": channels}
+
+
+def _single_channel_omero(image_info, smallest_level):
+    """One colored channel when the OME-XML gives a real color, else None.
+
+    White (or a missing/black color) means plain grayscale, which the viewer
+    and thumbnail already show without an omero block.
+    """
+    meta = image_info["channel_meta"]
+    color = meta[0].get("color") if meta else None
+    if color in (None, "000000", "FFFFFF"):
+        return None
+    return {"channels": [_omero_channel(image_info, smallest_level, 0, color)]}
+
+
+def _omero_channel(image_info, smallest_level, c, color):
+    """One omero channel entry: color, OME name and a 0.1-99.9% contrast window
+    measured on the smallest pyramid level (array axes are c[,z],y,x)."""
     dtype = np.dtype(image_info["dtype"])
     if np.issubdtype(dtype, np.integer):
         dmin, dmax = int(np.iinfo(dtype).min), int(np.iinfo(dtype).max)
     else:
         dmin, dmax = 0.0, 1.0
 
-    is_3d = smallest_level.ndim == 4
-    channels = []
-    for c in range(size_c):
-        if is_3d:
-            nz = smallest_level.shape[1]
-            values = np.asarray(smallest_level[c, ::max(1, nz // 16)])
-        else:
-            values = np.asarray(smallest_level[c])
-        lo, hi = (np.percentile(values, [0.1, 99.9]) if values.size else (dmin, dmax))
-        lo, hi = float(lo), float(hi)
-        if hi <= lo:
-            hi = lo + 1
-        name = meta[c].get("name") if c < len(meta) else None
-        channels.append({
-            "color": colors[c],
-            "label": name or f"Channel {c + 1}",
-            "active": True,
-            "window": {"min": dmin, "max": dmax, "start": lo, "end": hi},
-        })
-        log.info("  Channel %d '%s': color #%s window [%g, %g]",
-                 c, channels[-1]["label"], colors[c], lo, hi)
-
-    # No rdefs.model here: the viewer reads model "color" with 3 channels as RGB.
-    return {"channels": channels}
+    if smallest_level.ndim == 4:
+        nz = smallest_level.shape[1]
+        values = np.asarray(smallest_level[c, ::max(1, nz // 16)])
+    else:
+        values = np.asarray(smallest_level[c])
+    lo, hi = (np.percentile(values, [0.1, 99.9]) if values.size else (dmin, dmax))
+    lo, hi = float(lo), float(hi)
+    if hi <= lo:
+        hi = lo + 1
+    meta = image_info["channel_meta"]
+    name = meta[c].get("name") if c < len(meta) else None
+    entry = {
+        "color": color,
+        "label": name or f"Channel {c + 1}",
+        "active": True,
+        "window": {"min": dmin, "max": dmax, "start": lo, "end": hi},
+    }
+    log.info("  Channel %d '%s': color #%s window [%g, %g]", c, entry["label"], color, lo, hi)
+    return entry
 
 
 def process_file(filepath, output_dir, config):
