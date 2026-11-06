@@ -371,12 +371,19 @@ def write_strips(imgs, arr, z0, tile_size, is_3d, channel=None):
                 dtype=dtype,
             ).transpose(2, 0, 1))
 
-        if is_3d:
-            # arr shape: (C, Z, H, W); stack the planes on the Z axis
-            arr[c_slice, z0:z0 + len(rows), ty:ty + th, :] = np.stack(rows, axis=1)
-        else:
-            # arr shape: (C, H, W)
-            arr[c_slice, ty:ty + th, :] = rows[0]
+        block = np.stack(rows, axis=1) if is_3d else rows[0]
+        # One chunk per assignment. Assigning the whole row lets zarr write its
+        # chunks from parallel threads into the same directory, and on EFS that
+        # intermittently failed with FileNotFoundError when renaming a chunk's
+        # temporary .partial file into place.
+        for tx in range(0, width, tile_size):
+            tw = min(tile_size, width - tx)
+            if is_3d:
+                # arr shape: (C, Z, H, W); the block holds all slices of the chunk
+                arr[c_slice, z0:z0 + len(rows), ty:ty + th, tx:tx + tw] = block[..., tx:tx + tw]
+            else:
+                # arr shape: (C, H, W)
+                arr[c_slice, ty:ty + th, tx:tx + tw] = block[..., tx:tx + tw]
 
 
 def write_ome_zarr(image_info, pyramid_plan, out_path, config,
