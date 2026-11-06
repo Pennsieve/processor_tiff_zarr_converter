@@ -1,4 +1,4 @@
 awslambdaric
 pyvips>=2.2.1
-zarr>=3
+zarr==3.4.2
 numpy
