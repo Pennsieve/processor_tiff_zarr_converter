@@ -27,8 +27,8 @@ For multichannel images, the OME colors are kept; only a channel whose color is 
 
 | Variable | Source (ECS) | Source (Lambda) | Description |
 |---|---|---|---|
-| `INPUT_DIR` | Container override | Payload (`inputDir`) | Path to input files on EFS |
-| `OUTPUT_DIR` | Container override | Payload (`outputDir`) | Path to write output on EFS |
+| `INPUT_DIR` | Container override | Payload (`inputDir`) | The input files, on the step's local disk (`/data/input` on ECS, under `/tmp` on Lambda) |
+| `OUTPUT_DIR` | Container override | Payload (`outputDir`) | Where to write the OME-Zarr, on the same local disk (`/data/output` on ECS); uploaded when the step ends |
 | `WORKFLOW_INSTANCE_ID` | Container override | Payload (`workflowInstanceId`) | Unique workflow execution identifier |
 | `SESSION_TOKEN` | Container override | Payload (`sessionToken`) | Cognito access token |
 | `REFRESH_TOKEN` | Container override | Payload (`refreshToken`) | Token refresh credential |
@@ -37,6 +37,10 @@ For multichannel images, the OME colors are kept; only a channel whose color is 
 | `ENVIRONMENT` | Container override | Lambda config | Environment name (dev/prod) |
 | `REGION` | Container override | Lambda config | AWS region |
 | `DEPLOYMENT_MODE` | Container override | Lambda config | Security scope (basic/secure/compliant) |
+
+### Disk
+
+A step runs on its own local disk, not on shared storage. The compute node sizes it from the inputs: the TIFF, the image, about twice the TIFF for what the step writes, and headroom. Over 200 GB the step gets its own EBS volume. The OME-Zarr pyramid is a little larger than a compressed TIFF, so the plan normally fits; a step that still runs out of disk (`OSError: [Errno 28] No space left on device`) can be given a floor: the **Disk** field in the run setup on the run page, or `runtime.diskGiB` in `app.yml` for every run of this app.
 
 ### Processor Parameters (set on Lambda config or container override; the ones in `app.yml` can be set on the workflow node)
 
