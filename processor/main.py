@@ -85,19 +85,50 @@ def find_tiff_files(input_dir):
     return files
 
 
+# OME PhysicalSize*Unit symbols -> micrometers. OME's default unit is µm.
+UNIT_TO_UM = {
+    "pm": 1e-6, "nm": 1e-3, "µm": 1.0, "\u03bcm": 1.0, "um": 1.0, "micron": 1.0,
+    "micrometer": 1.0, "mm": 1e3, "cm": 1e4, "m": 1e6,
+}
+
+
 def _parse_physical_sizes(ome_xml):
     """Return ((pz, py, px), found) in micrometers; found is a per-axis dict
     indicating whether the value came from OME metadata (True) or was
     defaulted to 1.0 because the attribute was absent (False).
+
+    Reads PhysicalSize{X,Y,Z} and their Unit attributes from the Pixels element
+    (converting nm, mm, etc. to µm), and accepts exponent notation (8.5e-2).
     """
-    def grab(key):
-        m = re.search(rf'{key}="([\d.]+)"', ome_xml or "")
-        if m:
-            return float(m.group(1)), True
-        return 1.0, False
-    pz, fz = grab("PhysicalSizeZ")
-    py, fy = grab("PhysicalSizeY")
-    px, fx = grab("PhysicalSizeX")
+    attrs = {}
+    if ome_xml and "<OME" in ome_xml:
+        try:
+            pixels = ET.fromstring(ome_xml).find(".//{*}Pixels")
+            if pixels is not None:
+                attrs = dict(pixels.attrib)
+        except ET.ParseError:
+            pass
+    if not attrs:
+        for m in re.finditer(r'(PhysicalSize[XYZ](?:Unit)?)="([^"]*)"', ome_xml or ""):
+            attrs.setdefault(m.group(1), m.group(2))
+
+    def grab(axis):
+        try:
+            value = float(attrs.get(f"PhysicalSize{axis}", ""))
+        except ValueError:
+            return 1.0, False
+        if not value > 0:
+            return 1.0, False
+        unit = attrs.get(f"PhysicalSize{axis}Unit", "µm").strip()
+        factor = UNIT_TO_UM.get(unit)
+        if factor is None:
+            log.warning("  Unknown PhysicalSize%sUnit '%s'; treating it as µm", axis, unit)
+            factor = 1.0
+        return value * factor, True
+
+    pz, fz = grab("Z")
+    py, fy = grab("Y")
+    px, fx = grab("X")
     return (pz, py, px), {"z": fz, "y": fy, "x": fx}
 
 
@@ -288,9 +319,6 @@ def compute_pyramid_plan(image_info, config, z_downsample):
 
     c_chunk = 1 if per_channel else bands
 
-    xy_unit = min(py, px) if min(py, px) > 0 else 1.0
-    z_ratio = pz / xy_unit
-
     levels = []
     level = 0
     while True:
@@ -310,19 +338,21 @@ def compute_pyramid_plan(image_info, config, z_downsample):
             z_shrink = 1
             lz = n_pages
 
-        if is_3d:
-            shape = (bands, lz, lh, lw)
-            chunks = (c_chunk, min(z_chunk_cfg, lz), tile_size, tile_size)
-            z_mult = float(xy_shrink) if z_downsample else 1.0
-            scale = [1.0, z_ratio * z_mult, float(xy_shrink), float(xy_shrink)]
-        else:
-            shape = (bands, lh, lw)
-            chunks = (c_chunk, tile_size, tile_size)
-            scale = [1.0, float(xy_shrink), float(xy_shrink)]
-
+        # Voxel size of this level in micrometers (the axes' unit). Before
+        # v1.3.5 the scale was in pixels (XY 1, 2, 4, ...; Z the Z/XY ratio),
+        # so viewers showed the right shape but a wrong scale bar.
         out_px = px * xy_shrink
         out_py = py * xy_shrink
         out_pz = pz * (xy_shrink if z_downsample else 1.0)
+
+        if is_3d:
+            shape = (bands, lz, lh, lw)
+            chunks = (c_chunk, min(z_chunk_cfg, lz), tile_size, tile_size)
+            scale = [1.0, out_pz, out_py, out_px]
+        else:
+            shape = (bands, lh, lw)
+            chunks = (c_chunk, tile_size, tile_size)
+            scale = [1.0, out_py, out_px]
 
         levels.append({
             "level": level,
