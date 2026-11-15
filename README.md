@@ -66,7 +66,7 @@ image.ome.zarr/
 ```
 
 Metadata includes:
-- **multiscales**: OME-Zarr v0.4 with `coordinateTransformations` encoding scale relative to the original full-resolution image
+- **multiscales**: OME-Zarr v0.4 with `coordinateTransformations` giving each level's voxel size in micrometers (from the OME PhysicalSize values; 1.0 per pixel when they are missing). Before v1.3.5 the scale was in pixels.
 - **omero**: channel rendering hints: fixed R/G/B for RGB images, or per-channel colors, names and windows from the OME-XML for multichannel images
 
 ## Dual-Mode Support
