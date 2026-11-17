@@ -48,6 +48,7 @@ For multichannel images, the OME colors are kept; only a channel whose color is 
 | `COMPRESSION_LEVEL` | `5` | Compression level (1-9, higher = smaller but slower) |
 | `MAX_LEVELS` | `0` | Maximum number of pyramid levels. `0` = auto (generate until min dimension reached) |
 | `MIN_DIMENSION` | `256` | Stop generating levels when both dimensions are at or below this value |
+| `VIPS_TMPDIR` | auto | Where libvips writes temporary files. Source pages over 100 MiB that can't be read randomly (strip TIFFs) are decoded to a temp file, not RAM. By default the converter picks whichever has the most free space: a `.vips-tmp` beside `OUTPUT_DIR`, one inside it, or the system temp dir. That keeps large stacks off the small ephemeral disk. |
 | `CHANNEL_CHUNKING` | `auto` | `auto` = bundled for RGB images, per-channel for grayscale (detected from TIFF photometric tag). `per-channel` = each channel is an independent chunk. `bundled` = all channels in one chunk. |
 
 ## Output Format

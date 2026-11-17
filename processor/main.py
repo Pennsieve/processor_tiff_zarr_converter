@@ -76,6 +76,47 @@ def validate_dirs(config):
     return True
 
 
+def setup_vips_tmp(output_dir):
+    """Point libvips' temporary files at the disk with the most free space.
+
+    Pages are opened with random access. libvips decodes a page under
+    VIPS_DISC_THRESHOLD (100 MiB) into memory and a larger one into a
+    temporary file under $TMPDIR (default /tmp). On the compute node /tmp sits
+    on the small ephemeral disk (~21 GiB), not the large volume, so a stack of
+    113 MB pages filled it and failed with "No space left on device".
+    libvips reads TMPDIR each time it makes a temp file, so setting it here is
+    enough. VIPS_TMPDIR, if set, wins. Otherwise the candidate with the most
+    free space is used, preferring one beside OUTPUT_DIR over one inside it.
+    libvips unlinks its temp files as soon as it opens them, so nothing is
+    left to upload, and the directory is removed at the end.
+    """
+    import tempfile
+    explicit = os.environ.get("VIPS_TMPDIR")
+    out = os.path.abspath(output_dir)
+    candidates = [explicit] if explicit else [
+        os.path.join(os.path.dirname(out), ".vips-tmp"),
+        os.path.join(out, ".vips-tmp"),
+        tempfile.gettempdir(),
+    ]
+    best, best_free = None, -1
+    for d in candidates:
+        try:
+            os.makedirs(d, exist_ok=True)
+            free = shutil.disk_usage(d).free
+        except OSError as e:
+            log.warning("  vips temp dir %s not usable: %s", d, e)
+            continue
+        if free > best_free:
+            best, best_free = d, free
+    for d in candidates:
+        if d != best and d.endswith(".vips-tmp"):
+            shutil.rmtree(d, ignore_errors=True)
+    if best:
+        os.environ["TMPDIR"] = best
+        log.info("  vips temp dir: %s (%.0f GiB free)", best, best_free / 2**30)
+    return best
+
+
 def find_tiff_files(input_dir):
     extensions = (".ome.tiff", ".ome.tif", ".tiff", ".tif")
     files = []
@@ -701,6 +742,7 @@ def run():
 
     if not validate_dirs(config):
         sys.exit(1)
+    vips_tmp = setup_vips_tmp(config["output_dir"])
 
     tiff_files = find_tiff_files(config["input_dir"])
     if not tiff_files:
@@ -712,6 +754,8 @@ def run():
     for filepath in tiff_files:
         process_file(filepath, config["output_dir"], config)
 
+    if vips_tmp and vips_tmp.endswith(".vips-tmp"):
+        shutil.rmtree(vips_tmp, ignore_errors=True)
     log.info("=== Processing complete ===")
 
 
