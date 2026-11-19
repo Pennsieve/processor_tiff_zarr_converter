@@ -761,3 +761,13 @@ def run():
 
 if __name__ == "__main__":
     run()
+    # Exit without interpreter teardown. With hundreds of source pages decoded
+    # to libvips temp files (390 373b6c65: 852 pages of 113 MB), the container
+    # exited with an error about a minute after "Processing complete", every
+    # time, so the step failed although the output was fully written. All
+    # output is on disk by now; flush the logs and leave. Errors raised by
+    # run() still exit non-zero before reaching this point.
+    logging.shutdown()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
