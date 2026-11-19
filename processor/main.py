@@ -658,8 +658,35 @@ def _single_channel_omero(image_info, smallest_level):
     return {"channels": [_omero_channel(image_info, smallest_level, 0, color)]}
 
 
+def background_level(values):
+    """Black level for a channel: its most common value, capped at the 5th
+    percentile so no more than about 5% of real pixels can go black.
+
+    For fluorescence the most common value is the background (mounting medium,
+    camera offset). Where tissue fills the frame the most common value can be
+    tissue, and the cap keeps the image from getting darker than a 5% clip.
+    Works for unsigned, signed and float data. Returns None for no values.
+    """
+    values = np.asarray(values).ravel()
+    if values.size == 0:
+        return None
+    if np.issubdtype(values.dtype, np.integer):
+        vmin = int(values.min())
+        span = int(values.max()) - vmin
+        if span < 1 << 20:
+            mode = float(np.bincount((values - vmin).astype(np.int64)).argmax() + vmin)
+        else:
+            counts, edges = np.histogram(values, 1024)
+            mode = float(edges[counts.argmax()])
+    else:
+        counts, edges = np.histogram(values[np.isfinite(values)], 1024)
+        mode = float(edges[counts.argmax()])
+    return min(mode, float(np.percentile(values, 5)))
+
+
 def _omero_channel(image_info, smallest_level, c, color):
-    """One omero channel entry: color, OME name and a 0.1-99.9% contrast window
+    """One omero channel entry: color, OME name and a contrast window (black level
+    at the background, see background_level; top at the 99.9th percentile)
     measured on the smallest pyramid level (array axes are c[,z],y,x)."""
     dtype = np.dtype(image_info["dtype"])
     if np.issubdtype(dtype, np.integer):
@@ -676,6 +703,13 @@ def _omero_channel(image_info, smallest_level, c, color):
     lo, hi = float(lo), float(hi)
     if hi <= lo:
         hi = lo + 1
+    # Raise the black level to the background, so a glowing mounting medium or
+    # camera offset shows black instead of a wash of the channel color. Zeros
+    # are left out: they are usually stitching padding, which otherwise pins
+    # the start at 0. Never lower than before, never at or past the top.
+    bg = background_level(values[values != 0])
+    if bg is not None and lo < bg < hi:
+        lo = bg
     meta = image_info["channel_meta"]
     name = meta[c].get("name") if c < len(meta) else None
     entry = {
